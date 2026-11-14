@@ -1,0 +1,34 @@
+{
+  "name": "bd-live-job-finder",
+  "version": "1.0.0",
+  "description": "Command-Based Live Telegram Job Finder Bot for Electrical Engineering & Maintenance across 115+ Official Bangladesh Company Career Portals (Zero Database)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "postinstall": "npx playwright install chromium --with-deps || npx playwright install chromium"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cheerio": "^1.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "p-limit": "^3.1.0",
+    "playwright": "^1.48.2",
+    "rss-parser": "^3.13.0",
+    "telegraf": "^4.16.3"
+  },
+  "keywords": [
+    "bangladesh-jobs",
+    "electrical-engineering",
+    "telegram-bot",
+    "web-scraping",
+    "telegraf",
+    "playwright",
+    "cheerio"
+  ],
+  "license": "MIT"
+}

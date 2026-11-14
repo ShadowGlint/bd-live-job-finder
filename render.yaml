@@ -1,0 +1,30 @@
+services:
+  # Option A: Always-On Web Service (Exposes GET /health + runs Telegram Bot via Polling)
+  - type: web
+    name: bd-live-job-finder
+    env: node
+    plan: starter
+    region: singapore
+    buildCommand: npm install && npx playwright install --with-deps chromium
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_TELEGRAM_ID
+        sync: false
+      - key: SCRAPE_CONCURRENCY
+        value: 5
+      - key: REQUEST_TIMEOUT_MS
+        value: 20000
+      - key: PLAYWRIGHT_TIMEOUT_MS
+        value: 30000
+      - key: ENABLE_PLAYWRIGHT
+        value: true
+      - key: EXCLUDE_ONLINE_PORTAL_ONLY
+        value: true
