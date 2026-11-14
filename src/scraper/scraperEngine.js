@@ -1,15 +1,11 @@
 /**
- * BD LIVE JOB FINDER — LIVE MULTI-STRATEGY WEB SCRAPER ENGINE
- * Strategies:
- * 1. Axios + Cheerio (Fast HTML parsing for static & server-rendered career pages)
- * 2. RSS Parser (For feed-enabled career/notice endpoints)
- * 3. Playwright Headless Chromium Fallback (For JS-rendered SPAs or dynamic tables)
- *
- * Strictly adheres to:
- * - Zero database or disk persistence
- * - Concurrency Queue (p-limit) so 100+ websites are never hit all at once
- * - Per-website timeout and isolated error handling (one failure never stops others)
- * - Polite User-Agent, robots/access restriction respect (never bypasses CAPTCHA/Login)
+ * BD LIVE JOB FINDER v2.0 — ADVANCED LIVE SCRAPER ENGINE WITH JSON DEDUPLICATION & RETRY
+ * Features:
+ * - Supports Private 300+ search (`/jobs`) and Government search (`/govt`)
+ * - Smart Retry with exponential backoff on transient network errors
+ * - Checks both In-Memory Deduplicator AND Persistent `data/job_logs.json` (`JsonJobStore`)
+ *   so any job already sent once is NEVER shown a second time
+ * - Logs complete search statistics & sent jobs into `data/job_logs.json`
  */
 
 const axios = require('axios');
@@ -31,9 +27,6 @@ const rssParser = new Parser({
   headers: { 'User-Agent': settings.userAgent }
 });
 
-/**
- * Resolves relative URLs safely against the company career page URL
- */
 function resolveUrl(baseUrl, relativeHref) {
   if (!relativeHref) return baseUrl;
   const trimmed = relativeHref.trim();
@@ -45,32 +38,24 @@ function resolveUrl(baseUrl, relativeHref) {
   }
 }
 
-/**
- * Checks if page response indicates a CAPTCHA, Cloudflare challenge, or Login wall
- */
 function isAccessRestricted(html = '', statusCode = 200) {
   if (statusCode === 401 || statusCode === 403) return true;
   const lower = html.toLowerCase();
   if (
     lower.includes('cf-browser-verification') ||
     lower.includes('challenge-platform') ||
-    lower.includes('g-recaptcha') && lower.length < 2500
+    (lower.includes('g-recaptcha') && lower.length < 2500)
   ) {
     return true;
   }
   return false;
 }
 
-/**
- * Parses HTML DOM with Cheerio to extract candidate job blocks/links/rows
- */
 function parseHtmlForJobCandidates(html, company) {
   const $ = cheerio.load(html);
   $('script, style, noscript, nav, footer, header, svg').remove();
 
   const rawCandidates = [];
-
-  // 1. Inspect structured job cards, table rows, list items, and anchor blocks
   const selectors = [
     'table tbody tr',
     '.job-item, .job-card, .career-item, .vacancy-item, .opening-item, .circular-item, .notice-item',
@@ -87,11 +72,9 @@ function parseHtmlForJobCandidates(html, company) {
       const rawText = node.text().replace(/\s+/g, ' ').trim();
       if (!rawText || rawText.length < 10 || rawText.length > 1800) return;
 
-      // Avoid duplicate parent/child extraction
       const snippetSig = rawText.slice(0, 120).toLowerCase();
       if (processedContainers.has(snippetSig)) return;
 
-      // Determine title and link
       let title = '';
       let href = '';
 
@@ -99,19 +82,29 @@ function parseHtmlForJobCandidates(html, company) {
         title = rawText;
         href = node.attr('href') || '';
       } else {
-        const heading = node.find('h1, h2, h3, h4, h5, strong, b, .title, .job-title, td:first-child, td:nth-child(2)').first();
-        const primaryAnchor =
-          node.find('a[href*=".pdf"], a[href*="job"], a[href*="career"], a[href*="circular"], a[href*="notice"], a[href*="apply"], a[href]').first();
+        const heading = node
+          .find('h1, h2, h3, h4, h5, strong, b, .title, .job-title, td:first-child, td:nth-child(2)')
+          .first();
+        const primaryAnchor = node
+          .find(
+            'a[href*=".pdf"], a[href*="job"], a[href*="career"], a[href*="circular"], a[href*="notice"], a[href*="apply"], a[href]'
+          )
+          .first();
 
-        title = heading.text().replace(/\s+/g, ' ').trim() || primaryAnchor.text().replace(/\s+/g, ' ').trim() || rawText.slice(0, 110);
+        title =
+          heading.text().replace(/\s+/g, ' ').trim() ||
+          primaryAnchor.text().replace(/\s+/g, ' ').trim() ||
+          rawText.slice(0, 110);
         href = primaryAnchor.attr('href') || '';
       }
 
       if (!title || title.length < 4 || title.length > 220) return;
 
-      // Ignore generic navigation links
-      if (/^(home|about us|contact us|privacy policy|login|sign in|register|read more|click here|download|view)$/i.test(title.trim())) {
-        // If title is generic like "Download" or "View" inside a table row, use the row's descriptive text as title
+      if (
+        /^(home|about us|contact us|privacy policy|login|sign in|register|read more|click here|download|view)$/i.test(
+          title.trim()
+        )
+      ) {
         if (el.tagName === 'tr') {
           const cells = node
             .find('td')
@@ -129,11 +122,8 @@ function parseHtmlForJobCandidates(html, company) {
       }
 
       const fullUrl = resolveUrl(company.careerPageUrl, href);
-
-      // Reject third-party job portal links (Section 8)
       if (isThirdPartyPortal(fullUrl)) return;
 
-      // Detect if the block only has an online portal button without circular/email
       const htmlSnippet = node.html() || '';
       const hasApplyButton = /(apply\s*online|apply\s*now)/i.test(rawText);
       const hasPdfLink = /\.pdf($|\?)/i.test(fullUrl) || /\.pdf/i.test(htmlSnippet);
@@ -154,35 +144,40 @@ function parseHtmlForJobCandidates(html, company) {
 }
 
 /**
- * Fetches HTML using Axios + Cheerio
+ * Fetches HTML with Axios + 1 automatic retry for transient network hiccups
  */
-async function scrapeWithAxios(company) {
-  const response = await axios.get(company.careerPageUrl, {
-    timeout: settings.requestTimeoutMs,
-    maxRedirects: 5,
-    headers: {
-      'User-Agent': settings.userAgent,
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8'
-    },
-    validateStatus: (status) => status >= 200 && status < 500
-  });
+async function scrapeWithAxios(company, retries = 1) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await axios.get(company.careerPageUrl, {
+        timeout: settings.requestTimeoutMs,
+        maxRedirects: 5,
+        headers: {
+          'User-Agent': settings.userAgent,
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8'
+        },
+        validateStatus: (status) => status >= 200 && status < 500
+      });
 
-  if (isAccessRestricted(String(response.data || ''), response.status)) {
-    throw new Error(`Access restricted or HTTP ${response.status} (Robots/Login/CAPTCHA respected)`);
+      if (isAccessRestricted(String(response.data || ''), response.status)) {
+        throw new Error(`Access restricted / HTTP ${response.status}`);
+      }
+      if (response.status >= 400) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const html =
+        typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
+      return parseHtmlForJobCandidates(html, company);
+    } catch (err) {
+      if (attempt === retries) throw err;
+      await new Promise((r) => setTimeout(r, 800));
+    }
   }
-
-  if (response.status >= 400) {
-    throw new Error(`HTTP Error ${response.status}`);
-  }
-
-  const html = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
-  return parseHtmlForJobCandidates(html, company);
+  return [];
 }
 
-/**
- * Fetches JS-rendered page using Playwright Chromium (when needed or configured)
- */
 async function scrapeWithPlaywright(company, browserInstance) {
   if (!settings.enablePlaywright || !browserInstance) {
     return scrapeWithAxios(company);
@@ -197,7 +192,6 @@ async function scrapeWithPlaywright(company, browserInstance) {
     });
     const page = await context.newPage();
 
-    // Block heavy media/fonts to speed up live scraping
     await page.route('**/*.{png,jpg,jpeg,gif,webp,svg,mp4,woff,woff2,ttf}', (route) =>
       route.abort()
     );
@@ -207,14 +201,13 @@ async function scrapeWithPlaywright(company, browserInstance) {
       timeout: settings.playwrightTimeoutMs
     });
 
-    // Brief wait for dynamic XHR job lists to settle
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1200);
 
     const status = response ? response.status() : 200;
     const html = await page.content();
 
     if (isAccessRestricted(html, status)) {
-      throw new Error(`Access restricted or HTTP ${status} (CAPTCHA/Login not bypassed)`);
+      throw new Error(`Access restricted / HTTP ${status}`);
     }
 
     return parseHtmlForJobCandidates(html, company);
@@ -225,9 +218,6 @@ async function scrapeWithPlaywright(company, browserInstance) {
   }
 }
 
-/**
- * Fetches RSS Feed if scrapingMethod === 'rss'
- */
 async function scrapeWithRss(company) {
   const feed = await rssParser.parseURL(company.careerPageUrl);
   return (feed.items || []).map((item) => ({
@@ -238,10 +228,7 @@ async function scrapeWithRss(company) {
   }));
 }
 
-/**
- * Scrapes a single company website with automatic fallback and filtering
- */
-async function scrapeSingleCompany(company, browserInstance, deduplicator) {
+async function scrapeSingleCompany(company, browserInstance, deduplicator, jsonStore, searchType = 'PRIVATE') {
   const result = {
     companyId: company.id,
     companyName: company.name,
@@ -249,7 +236,8 @@ async function scrapeSingleCompany(company, browserInstance, deduplicator) {
     success: false,
     error: null,
     relevantJobs: [],
-    notEligibleCount: 0
+    notEligibleCount: 0,
+    alreadySeenCount: 0
   };
 
   try {
@@ -261,17 +249,15 @@ async function scrapeSingleCompany(company, browserInstance, deduplicator) {
       try {
         rawCandidates = await scrapeWithPlaywright(company, browserInstance);
       } catch {
-        // Fallback to Axios if Playwright is unavailable or times out
         rawCandidates = await scrapeWithAxios(company);
       }
     } else {
-      // Default: Axios + Cheerio first, fallback to Playwright if 0 candidates and JS shell detected
       rawCandidates = await scrapeWithAxios(company);
       if (rawCandidates.length === 0 && settings.enablePlaywright && browserInstance) {
         try {
           rawCandidates = await scrapeWithPlaywright(company, browserInstance);
         } catch {
-          // Keep Axios result if Playwright fallback fails
+          // Keep Axios result
         }
       }
     }
@@ -279,50 +265,64 @@ async function scrapeSingleCompany(company, browserInstance, deduplicator) {
     result.success = true;
 
     for (const candidate of rawCandidates) {
-      // Step 1: Match Electrical & Maintenance Department Keywords
       const deptMatch = matchElectricalDepartment(candidate.title, candidate.rawText);
       if (!deptMatch.isRelevant) continue;
 
-      // Step 2: Evaluate Qualification Eligibility (Suitable / Review Required / Not Eligible)
       const qualEval = evaluateQualification(candidate.title, candidate.rawText);
       if (qualEval.status === 'NOT_ELIGIBLE') {
         result.notEligibleCount += 1;
-        continue; // Do not show Not Eligible jobs in main result list (Section 9)
+        continue;
       }
 
-      // Step 3: Evaluate Direct Apply Filter (Section 8)
       const appEval = evaluateApplicationMethod(
         candidate.rawText,
         candidate.url,
         candidate.hasApplyOnlineButtonOnly
       );
-      if (!appEval.allowed) {
-        continue;
-      }
+      if (!appEval.allowed) continue;
 
-      // Step 4: Extract Metadata Fields
       const meta = extractMetadataFields(candidate.title, candidate.rawText);
 
       const jobObj = {
         company: company.name,
         industry: company.industry,
+        officialWebsite: company.officialWebsite,
         position: candidate.title,
         department: meta.department,
         location: meta.location,
-        qualification: `${qualEval.qualificationText} (${qualEval.badge})`,
+        qualification: qualEval.qualificationText,
+        qualificationBadge: qualEval.badge,
         eligibilityStatus: qualEval.status,
         experience: meta.experience,
         salary: meta.salary,
         published: meta.published,
         deadline: meta.deadline,
         application: appEval.applicationInstruction,
+        applyEmail: appEval.applyEmail,
+        isPdfCircular: appEval.isPdfCircular,
+        matchedKeywords: deptMatch.matchedKeywords,
+        matchScore: deptMatch.matchScore,
+        searchType,
         url: candidate.url || company.careerPageUrl
       };
 
-      // Step 5: In-Memory Deduplication (Section 7)
-      if (deduplicator.isUnique(jobObj)) {
-        result.relevantJobs.push(jobObj);
+      // 1. Check In-Memory Deduplicator for current run
+      if (!deduplicator.isUnique(jobObj)) {
+        continue;
       }
+
+      // 2. Check Persistent JSON Store (`data/job_logs.json`) so a job shown once is NEVER shown a 2nd time!
+      if (jsonStore && jsonStore.hasSeenJob(jobObj)) {
+        result.alreadySeenCount += 1;
+        jsonStore.incrementDuplicatePrevented();
+        continue;
+      }
+
+      if (jsonStore) {
+        jsonStore.markJobAsSeen(jobObj, searchType);
+      }
+
+      result.relevantJobs.push(jobObj);
     }
   } catch (err) {
     result.success = false;
@@ -332,11 +332,14 @@ async function scrapeSingleCompany(company, browserInstance, deduplicator) {
   return result;
 }
 
-/**
- * Runs a full live job search across all active companies with concurrency control.
- * Memory is released immediately after return.
- */
-async function runLiveJobSearch(companiesList, onProgressCallback = null, runtimeState = null) {
+async function runLiveJobSearch(
+  companiesList,
+  onProgressCallback = null,
+  runtimeState = null,
+  jsonStore = null,
+  searchType = 'PRIVATE'
+) {
+  const startTime = Date.now();
   const activeCompanies = companiesList.filter((c) => c.websiteStatus === 'active');
   const limit = pLimit(settings.scrapeConcurrency);
   const deduplicator = new JobDeduplicator();
@@ -358,20 +361,30 @@ async function runLiveJobSearch(companiesList, onProgressCallback = null, runtim
   let successfulWebsites = 0;
   let failedWebsites = 0;
   let notEligibleJobs = 0;
+  let alreadySeenSkipped = 0;
   const allRelevantJobs = [];
   const failedDetails = [];
+
+  const progressInterval = activeCompanies.length > 100 ? 50 : 10;
 
   try {
     const tasks = activeCompanies.map((company) =>
       limit(async () => {
         if (runtimeState) runtimeState.currentActiveScrapingTasks += 1;
         try {
-          const res = await scrapeSingleCompany(company, browserInstance, deduplicator);
+          const res = await scrapeSingleCompany(
+            company,
+            browserInstance,
+            deduplicator,
+            jsonStore,
+            searchType
+          );
           completedCount += 1;
 
           if (res.success) {
             successfulWebsites += 1;
             notEligibleJobs += res.notEligibleCount;
+            alreadySeenSkipped += res.alreadySeenCount;
             if (res.relevantJobs.length > 0) {
               allRelevantJobs.push(...res.relevantJobs);
             }
@@ -383,11 +396,12 @@ async function runLiveJobSearch(companiesList, onProgressCallback = null, runtim
             });
           }
 
-          if (onProgressCallback && completedCount % 25 === 0) {
+          if (onProgressCallback && completedCount % progressInterval === 0) {
             await onProgressCallback({
               completedCount,
               total: activeCompanies.length,
-              foundSoFar: allRelevantJobs.length
+              foundSoFar: allRelevantJobs.length,
+              alreadySeenSkipped
             }).catch(() => {});
           }
 
@@ -406,15 +420,34 @@ async function runLiveJobSearch(companiesList, onProgressCallback = null, runtim
     }
   }
 
-  return {
+  // Sort jobs so SUITABLE + highest matchScore appear first
+  allRelevantJobs.sort((a, b) => {
+    if (a.eligibilityStatus !== b.eligibilityStatus) {
+      return a.eligibilityStatus === 'SUITABLE' ? -1 : 1;
+    }
+    return (b.matchScore || 0) - (a.matchScore || 0);
+  });
+
+  const durationSeconds = Math.max(1, Math.round((Date.now() - startTime) / 1000));
+
+  const summary = {
+    searchType,
+    durationSeconds,
     totalWebsitesChecked: activeCompanies.length,
     successfulWebsites,
     failedWebsites,
     relevantJobsFound: allRelevantJobs.length,
+    alreadySeenSkipped,
     notEligibleJobs,
     jobs: allRelevantJobs,
     failedDetails
   };
+
+  if (jsonStore) {
+    jsonStore.recordSearchLog(summary, searchType);
+  }
+
+  return summary;
 }
 
 module.exports = {

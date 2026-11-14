@@ -1,0 +1,16 @@
+{
+  "meta": {
+    "project": "BD Live Job Finder v2.0",
+    "createdAt": "2026-11-14T14:00:00.000Z",
+    "lastUpdatedAt": "2026-11-14T14:00:00.000Z"
+  },
+  "stats": {
+    "totalSearchesRun": 0,
+    "totalPrivateSearches": 0,
+    "totalGovtSearches": 0,
+    "totalUniqueJobsSent": 0,
+    "totalDuplicateJobsPrevented": 0
+  },
+  "seenJobs": {},
+  "searchLogs": []
+}
